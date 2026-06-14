@@ -37,7 +37,7 @@ static int SHOULDER_MIN = 5, SHOULDER_MAX = 175;
 static int ELBOW_MIN = 5, ELBOW_MAX = 175;
 static int GRIPPER_MIN = 10, GRIPPER_MAX = 170;
 
-// Safe startup sequence targets
+// Safe startup fallback sequence targets
 static const int STARTUP_ELBOW    = 90;
 static const int STARTUP_SHOULDER = 90;
 static const int STARTUP_BODY     = 0;
@@ -53,6 +53,12 @@ static const uint32_t SERVO_TICK_MS = 20;
 static const int SERVO_STEP_DEG = 1;
 static const int SERVO_DEADBAND_DEG = 0;
 static const uint32_t START_MOVE_SETTLE_MS = 400;
+static const uint32_t MQTT_RETRY_MS = 5000;
+static const uint32_t POSE_SAVE_MS = 2000;
+static const int POSE_SAVE_DELTA_DEG = 1;
+
+uint32_t lastMqttAttemptMs = 0;
+uint32_t lastPoseSaveMs = 0;
 
 // Macro storage
 static const int MAX_MACROS = 12;
@@ -79,6 +85,7 @@ Servo servoGripper;
 Preferences prefs;
 
 bool servosAttached = false;
+bool resumePoseValid = false;
 
 int curBody = STARTUP_BODY;
 int curShoulder = STARTUP_SHOULDER;
@@ -109,6 +116,11 @@ int limNegBody = -90, limPosBody = 90;
 int limNegShoulder = -85, limPosShoulder = 85;
 int limNegElbow = -85, limPosElbow = 85;
 int limNegGripper = -80, limPosGripper = 80;
+
+int lastSavedBody = STARTUP_BODY;
+int lastSavedShoulder = STARTUP_SHOULDER;
+int lastSavedElbow = STARTUP_ELBOW;
+int lastSavedGripper = STARTUP_GRIPPER;
 
 uint32_t lastServoTick = 0;
 
@@ -177,7 +189,9 @@ String buildStateJson() {
   s += "\"detail\":\"" + jsonEscape(lastDetail) + "\",";
   s += "\"device\":\"" + String(DEVICE_NAME) + "\",";
   s += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  s += "\"mqttConnected\":" + String(mqtt.connected() ? "true" : "false") + ",";
   s += "\"attached\":" + String(servosAttached ? "true" : "false") + ",";
+  s += "\"resumePoseValid\":" + String(resumePoseValid ? "true" : "false") + ",";
   s += "\"startupAbs\":{";
   s += "\"body\":" + String(STARTUP_BODY) + ",";
   s += "\"shoulder\":" + String(STARTUP_SHOULDER) + ",";
@@ -256,6 +270,68 @@ void saveLimits() {
   prefs.putInt("eNeg", limNegElbow);    prefs.putInt("ePos", limPosElbow);
   prefs.putInt("gNeg", limNegGripper);  prefs.putInt("gPos", limPosGripper);
   prefs.end();
+}
+
+void loadResumePose() {
+  prefs.begin("armpose", true);
+  resumePoseValid = prefs.getBool("valid", false);
+  if (resumePoseValid) {
+    curBody = clampInt(prefs.getInt("body", STARTUP_BODY), BODY_MIN, BODY_MAX);
+    curShoulder = clampInt(prefs.getInt("shoulder", STARTUP_SHOULDER), SHOULDER_MIN, SHOULDER_MAX);
+    curElbow = clampInt(prefs.getInt("elbow", STARTUP_ELBOW), ELBOW_MIN, ELBOW_MAX);
+    curGripper = clampInt(prefs.getInt("gripper", STARTUP_GRIPPER), GRIPPER_MIN, GRIPPER_MAX);
+  } else {
+    curBody = STARTUP_BODY;
+    curShoulder = STARTUP_SHOULDER;
+    curElbow = STARTUP_ELBOW;
+    curGripper = STARTUP_GRIPPER;
+  }
+  prefs.end();
+
+  tgtAbsBody = curBody;
+  tgtAbsShoulder = curShoulder;
+  tgtAbsElbow = curElbow;
+  tgtAbsGripper = curGripper;
+
+  zeroAbsBody = curBody;
+  zeroAbsShoulder = curShoulder;
+  zeroAbsElbow = curElbow;
+  zeroAbsGripper = curGripper;
+
+  lastSavedBody = curBody;
+  lastSavedShoulder = curShoulder;
+  lastSavedElbow = curElbow;
+  lastSavedGripper = curGripper;
+}
+
+void saveResumePoseNow() {
+  prefs.begin("armpose", false);
+  prefs.putBool("valid", true);
+  prefs.putInt("body", curBody);
+  prefs.putInt("shoulder", curShoulder);
+  prefs.putInt("elbow", curElbow);
+  prefs.putInt("gripper", curGripper);
+  prefs.end();
+
+  lastSavedBody = curBody;
+  lastSavedShoulder = curShoulder;
+  lastSavedElbow = curElbow;
+  lastSavedGripper = curGripper;
+  lastPoseSaveMs = millis();
+}
+
+void maybeSaveResumePose() {
+  uint32_t now = millis();
+  if (now - lastPoseSaveMs < POSE_SAVE_MS) return;
+
+  bool changed =
+    abs(curBody - lastSavedBody) >= POSE_SAVE_DELTA_DEG ||
+    abs(curShoulder - lastSavedShoulder) >= POSE_SAVE_DELTA_DEG ||
+    abs(curElbow - lastSavedElbow) >= POSE_SAVE_DELTA_DEG ||
+    abs(curGripper - lastSavedGripper) >= POSE_SAVE_DELTA_DEG;
+
+  if (!changed) return;
+  saveResumePoseNow();
 }
 
 void clearMacroSlots() {
@@ -378,7 +454,7 @@ void attachServosIfNeeded() {
 void waitWithBackground(uint32_t ms) {
   uint32_t t0 = millis();
   while (millis() - t0 < ms) {
-    mqtt.loop();
+    if (mqtt.connected()) mqtt.loop();
     http.handleClient();
     delay(5);
   }
@@ -392,7 +468,7 @@ void moveSingleServoBlocking(Servo& servo, int& cur, int target, int minVal, int
     else cur -= min(SERVO_STEP_DEG, -diff);
     cur = clampInt(cur, minVal, maxVal);
     servo.write(cur);
-    mqtt.loop();
+    if (mqtt.connected()) mqtt.loop();
     http.handleClient();
     delay(SERVO_TICK_MS);
   }
@@ -401,10 +477,19 @@ void moveSingleServoBlocking(Servo& servo, int& cur, int target, int minVal, int
 
 void runStartupSequence() {
   attachServosIfNeeded();
-  moveSingleServoBlocking(servoElbow,    curElbow,    STARTUP_ELBOW,    ELBOW_MIN,    ELBOW_MAX);
-  moveSingleServoBlocking(servoShoulder, curShoulder, STARTUP_SHOULDER, SHOULDER_MIN, SHOULDER_MAX);
-  moveSingleServoBlocking(servoBody,     curBody,     STARTUP_BODY,     BODY_MIN,     BODY_MAX);
-  moveSingleServoBlocking(servoGripper,  curGripper,  STARTUP_GRIPPER,  GRIPPER_MIN,  GRIPPER_MAX);
+
+  if (resumePoseValid) {
+    servoBody.write(curBody);
+    servoShoulder.write(curShoulder);
+    servoElbow.write(curElbow);
+    servoGripper.write(curGripper);
+    waitWithBackground(START_MOVE_SETTLE_MS);
+  } else {
+    moveSingleServoBlocking(servoElbow,    curElbow,    STARTUP_ELBOW,    ELBOW_MIN,    ELBOW_MAX);
+    moveSingleServoBlocking(servoShoulder, curShoulder, STARTUP_SHOULDER, SHOULDER_MIN, SHOULDER_MAX);
+    moveSingleServoBlocking(servoBody,     curBody,     STARTUP_BODY,     BODY_MIN,     BODY_MAX);
+    moveSingleServoBlocking(servoGripper,  curGripper,  STARTUP_GRIPPER,  GRIPPER_MIN,  GRIPPER_MAX);
+  }
 
   tgtAbsBody = curBody;
   tgtAbsShoulder = curShoulder;
@@ -418,6 +503,7 @@ void runStartupSequence() {
 
   resetRelativeModel();
   lastServoTick = millis();
+  saveResumePoseNow();
 }
 
 void stepServoToward(Servo& s, int& cur, int tgt) {
@@ -688,9 +774,9 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   <style>
     body{font-family:system-ui,Arial,sans-serif;background:#111;color:#eee;margin:0;padding:20px}
     h1,h2{margin:0 0 12px}
-    .grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+    .grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
     .card{background:#1b1b1b;border:1px solid #333;border-radius:12px;padding:16px}
-    label{display:block;margin:10px 0 4px}
+    label{display:block;margin:8px 0 4px}
     input[type=number],input[type=text]{width:100%;padding:10px;border-radius:8px;border:1px solid #444;background:#0f0f0f;color:#fff;box-sizing:border-box}
     button{padding:10px 14px;border-radius:8px;border:0;background:#2d6cdf;color:#fff;cursor:pointer;margin:6px 6px 0 0}
     button.danger{background:#a33}
@@ -698,6 +784,19 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     .mono{font-family:ui-monospace,SFMono-Regular,monospace;white-space:pre-wrap}
     .macro{border-top:1px solid #333;padding-top:10px;margin-top:10px}
     .row{display:flex;gap:8px;flex-wrap:wrap}
+    .sliders-card{grid-column:1/-1}
+    .u-wrap{display:grid;grid-template-columns:1fr 1fr;gap:28px;align-items:end;justify-items:center;margin:8px 0 18px}
+    .vertical-wrap{display:flex;flex-direction:column;align-items:center;gap:10px}
+    .vertical{appearance:slider-vertical;-webkit-appearance:slider-vertical;width:28px;height:260px;background:transparent}
+    input[type=range].vertical{writing-mode:bt-lr}
+    .horizontal-wrap{display:flex;flex-direction:column;align-items:center;gap:10px}
+    .horizontal{width:min(520px,100%)}
+    .compact .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .small{font-size:12px;color:#bbb}
+    @supports not (-webkit-appearance: slider-vertical) {
+      .vertical{width:260px;height:28px;transform:rotate(-90deg)}
+      .vertical-wrap{padding:120px 0}
+    }
   </style>
 </head>
 <body>
@@ -709,22 +808,45 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       <button onclick="refreshState()">Aktualisieren</button>
     </div>
 
-    <div class="card">
-      <h2>Absolute Position fahren</h2>
-      <label>Body</label><input id="body" type="number" min="0" max="180" value="0">
-      <label>Shoulder</label><input id="shoulder" type="number" min="5" max="175" value="90">
-      <label>Elbow</label><input id="elbow" type="number" min="5" max="175" value="90">
-      <label>Gripper</label><input id="gripper" type="number" min="10" max="170" value="90">
-      <button onclick="moveAbs()">Position fahren</button>
-      <button class="secondary" onclick="fillCurrent()">Aktuelle Position übernehmen</button>
-    </div>
-
-    <div class="card">
+    <div class="card compact">
       <h2>Makro speichern</h2>
       <label>Name</label><input id="macroName" type="text" placeholder="z. B. park">
       <div class="row">
         <button onclick="saveMacroFromInputs()">Eingegebene Position speichern</button>
         <button onclick="captureCurrentMacro()">Aktuelle Position speichern</button>
+      </div>
+    </div>
+
+    <div class="card sliders-card">
+      <h2>Fließende Steuerung</h2>
+      <div class="small">U-Form: links Elbow, rechts Shoulder, unten Body. Änderungen fahren direkt los.</div>
+      <div class="u-wrap">
+        <div class="vertical-wrap">
+          <div>Elbow: <span id="elbowVal">90</span></div>
+          <input id="elbowSlider" class="vertical" type="range" min="5" max="175" value="90" oninput="sliderChanged()">
+        </div>
+        <div class="vertical-wrap">
+          <div>Shoulder: <span id="shoulderVal">90</span></div>
+          <input id="shoulderSlider" class="vertical" type="range" min="5" max="175" value="90" oninput="sliderChanged()">
+        </div>
+      </div>
+      <div class="horizontal-wrap">
+        <div>Body: <span id="bodyVal">0</span></div>
+        <input id="bodySlider" class="horizontal" type="range" min="0" max="180" value="0" oninput="sliderChanged()">
+      </div>
+    </div>
+
+    <div class="card compact">
+      <h2>Absolute Position fahren</h2>
+      <div class="row2">
+        <div><label>Body</label><input id="body" type="number" min="0" max="180" value="0"></div>
+        <div><label>Shoulder</label><input id="shoulder" type="number" min="5" max="175" value="90"></div>
+        <div><label>Elbow</label><input id="elbow" type="number" min="5" max="175" value="90"></div>
+        <div><label>Gripper</label><input id="gripper" type="number" min="10" max="170" value="90"></div>
+      </div>
+      <div class="row">
+        <button onclick="moveAbs()">Position fahren</button>
+        <button class="secondary" onclick="fillCurrent()">Aktuelle Position übernehmen</button>
       </div>
     </div>
 
@@ -735,6 +857,9 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   </div>
 
 <script>
+let moveTimer = null;
+let suppressSliderSync = false;
+
 async function api(path, options={}) {
   const res = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, options));
   return res.json();
@@ -747,10 +872,22 @@ function setInputsFromPose(p){
   document.getElementById('gripper').value = p.gripper;
 }
 
+function setSliderPose(p){
+  suppressSliderSync = true;
+  document.getElementById('bodySlider').value = p.body;
+  document.getElementById('shoulderSlider').value = p.shoulder;
+  document.getElementById('elbowSlider').value = p.elbow;
+  document.getElementById('bodyVal').textContent = p.body;
+  document.getElementById('shoulderVal').textContent = p.shoulder;
+  document.getElementById('elbowVal').textContent = p.elbow;
+  suppressSliderSync = false;
+}
+
 async function refreshState(){
   const s = await api('/api/state');
   document.getElementById('status').textContent = JSON.stringify(s, null, 2);
   renderMacros(s.macros || []);
+  setSliderPose(s.curAbs);
 }
 
 function renderMacros(macros){
@@ -781,10 +918,36 @@ function getInputPose(){
   };
 }
 
+function getSliderPose(){
+  return {
+    body: Number(document.getElementById('bodySlider').value),
+    shoulder: Number(document.getElementById('shoulderSlider').value),
+    elbow: Number(document.getElementById('elbowSlider').value),
+    gripper: Number(document.getElementById('gripper').value)
+  };
+}
+
 async function moveAbs(){
   const p = getInputPose();
   await api('/api/move_abs', {method:'POST', body: JSON.stringify(p)});
+  setSliderPose(p);
   refreshState();
+}
+
+function sliderChanged(){
+  document.getElementById('bodyVal').textContent = document.getElementById('bodySlider').value;
+  document.getElementById('shoulderVal').textContent = document.getElementById('shoulderSlider').value;
+  document.getElementById('elbowVal').textContent = document.getElementById('elbowSlider').value;
+  if (suppressSliderSync) return;
+  const p = getSliderPose();
+  document.getElementById('body').value = p.body;
+  document.getElementById('shoulder').value = p.shoulder;
+  document.getElementById('elbow').value = p.elbow;
+  if (moveTimer) clearTimeout(moveTimer);
+  moveTimer = setTimeout(async () => {
+    await api('/api/move_abs', {method:'POST', body: JSON.stringify(p)});
+    refreshState();
+  }, 80);
 }
 
 async function saveMacroFromInputs(){
@@ -817,12 +980,14 @@ async function deleteMacro(nameJson){
 function loadMacroIntoInputs(macroJson){
   const m = JSON.parse(macroJson);
   setInputsFromPose(m);
+  setSliderPose(m);
   document.getElementById('macroName').value = m.name;
 }
 
 async function fillCurrent(){
   const s = await api('/api/state');
   setInputsFromPose(s.curAbs);
+  setSliderPose(s.curAbs);
 }
 
 refreshState();
@@ -1004,15 +1169,21 @@ void ensureWiFi() {
 }
 
 void ensureMqtt() {
+  if (WiFi.status() != WL_CONNECTED) return;
   if (mqtt.connected()) return;
-  while (!mqtt.connected()) {
-    if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS, TOPIC_AVAIL, 1, true, "offline")) {
-      mqtt.publish(TOPIC_AVAIL, "online", true);
-      mqtt.subscribe(TOPIC_CMD);
-      publishState("ready", "online");
-    } else {
-      delay(1500);
-    }
+
+  uint32_t now = millis();
+  if (now - lastMqttAttemptMs < MQTT_RETRY_MS) return;
+  lastMqttAttemptMs = now;
+
+  bool ok = mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS, TOPIC_AVAIL, 1, true, "offline");
+  if (ok) {
+    mqtt.publish(TOPIC_AVAIL, "online", true);
+    mqtt.subscribe(TOPIC_CMD);
+    publishState("ready", "mqtt connected");
+  } else {
+    Serial.print("MQTT connect failed, rc=");
+    Serial.println(mqtt.state());
   }
 }
 
@@ -1024,6 +1195,7 @@ void setup() {
   clearMacroSlots();
   loadLimits();
   loadMacros();
+  loadResumePose();
   ensureWiFi();
 
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
@@ -1032,13 +1204,14 @@ void setup() {
   setupHttp();
   runStartupSequence();
 
-  publishState("ready", "booted, homed, ui ready");
+  publishState("ready", resumePoseValid ? "booted, resumed pose, ui ready" : "booted, fallback startup, ui ready");
 }
 
 void loop() {
   ensureWiFi();
   ensureMqtt();
-  mqtt.loop();
+  if (mqtt.connected()) mqtt.loop();
   http.handleClient();
   serviceServos();
+  maybeSaveResumePose();
 }
